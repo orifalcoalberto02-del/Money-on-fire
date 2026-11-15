@@ -24,6 +24,7 @@ const parseAmt = v => {
   return Number.isFinite(n) ? Math.round(n * 100) / 100 : NaN;
 };
 const fmtInput = n => (n === '' || n == null ? '' : (typeof n === 'number' ? n.toFixed(2) : String(n)).replace('.', ','));
+const cu = (v, k = 'eur', pre = '', d = 0, txt) => `<span class="cu" data-v="${+v || 0}" data-k="${k}" data-p="${pre}"${d ? ` data-d="${d}"` : ''}>${txt ?? (pre + eur(v))}</span>`;
 const rem = d => Math.max(0, Math.round(((+d.amount || 0) - (+d.paid || 0)) * 100) / 100);
 
 const DEF_OUT = ['Casa', 'Spesa', 'Trasporti', 'Auto', 'Ristoranti', 'Salute', 'Svago', 'Abbonamenti', 'Shopping', 'Attrezzatura', 'Software', 'Tasse e IVA', 'Altro'];
@@ -110,7 +111,8 @@ const run = p => Promise.resolve(p).catch(e => { console.error(e); toast('Errore
 const S = {
   tx: [], rec: [], debt: [], settings: { budgets: {} },
   view: 'home', ym: curYM(), scope: 'all', search: '', showSettled: false,
-  mode: 'local', user: null, authReady: false, fatal: '', onSubmit: null, curDebt: null
+  mode: 'local', user: null, authReady: false, fatal: '', onSubmit: null, curDebt: null,
+  loaded: true, authMode: 'in', sync: 'wait', syncErr: ''
 };
 try { S.scope = localStorage.getItem('cassa:scope') || 'all'; } catch { /* ignora */ }
 
@@ -151,40 +153,94 @@ async function firebaseStore() {
   ]);
   const app = A.initializeApp(firebaseConfig);
   const auth = Au.getAuth(app);
-  const db = F.initializeFirestore(app, { localCache: F.persistentLocalCache({ tabManager: F.persistentMultipleTabManager() }) });
-  let unsubs = [], uid = null;
+  let db;
+  try {
+    db = F.initializeFirestore(app, {
+      localCache: F.persistentLocalCache({ tabManager: F.persistentMultipleTabManager() }),
+      ignoreUndefinedProperties: true,
+      // aiuta con VPN, proxy e blocchi dei contenuti, che a volte impediscono l'invio dei dati
+      experimentalAutoDetectLongPolling: true
+    });
+  } catch (e) { console.warn(e); db = F.getFirestore(app); }
+  let unsubs = [], uid = null, meta = {}, got = new Set();
   const stop = () => { unsubs.forEach(u => u()); unsubs = []; };
+  const gProvider = () => new Au.GoogleAuthProvider();
+  const syncOf = () => {
+    if (S.syncErr) return 'err';
+    if (!navigator.onLine) return 'off';
+    return Object.values(meta).some(m => m.pending || m.cache) ? 'wait' : 'ok';
+  };
+  const refreshSync = () => setSync(syncOf());
+  window.addEventListener('online', refreshSync);
+  window.addEventListener('offline', refreshSync);
+  Au.getRedirectResult(auth).catch(x => toast(authMsg(x) || 'Accesso non riuscito'));
+
+  const watch = (key, ref, apply) => unsubs.push(F.onSnapshot(ref, { includeMetadataChanges: true }, snap => {
+    meta[key] = { pending: snap.metadata.hasPendingWrites, cache: snap.metadata.fromCache };
+    apply(snap); got.add(key); S.syncErr = '';
+    if (got.size === 4) S.loaded = true;
+    refreshSync(); render();
+  }, err => {
+    console.error(err);
+    S.syncErr = err.code || 'errore'; got.add(key);
+    if (got.size === 4) S.loaded = true;
+    toast(err.code === 'permission-denied' ? 'Permesso negato: controlla le regole di Firestore.' : 'Sincronizzazione: ' + err.message);
+    refreshSync(); render();
+  }));
+  const need = () => { if (!uid) throw new Error('Non sei collegato.'); };
+
   return {
     kind: 'cloud',
     auth: {
       signIn: (e, p) => Au.signInWithEmailAndPassword(auth, e, p),
       signUp: (e, p) => Au.createUserWithEmailAndPassword(auth, e, p),
-      reset: e => Au.sendPasswordResetEmail(auth, e)
+      reset: e => Au.sendPasswordResetEmail(auth, e),
+      google: async () => {
+        try { await Au.signInWithPopup(auth, gProvider()); }
+        catch (x) {
+          // se il popup è bloccato (capita nelle app installate) si passa alla pagina di accesso di Google
+          if (['auth/popup-blocked', 'auth/operation-not-supported-in-this-environment'].includes(x.code)) return Au.signInWithRedirect(auth, gProvider());
+          throw x;
+        }
+      },
+      providers: () => (auth.currentUser?.providerData || []).map(p => p.providerId),
+      // elimina tutti i dati dell'utente, poi l'account
+      deleteAccount: async password => {
+        const u = auth.currentUser; if (!u) throw new Error('Non sei collegato.');
+        if (!navigator.onLine) throw new Error('Serve la connessione a internet per eliminare l\'account.');
+        if (password) await Au.reauthenticateWithCredential(u, Au.EmailAuthProvider.credential(u.email, password));
+        else await Au.reauthenticateWithPopup(u, gProvider());
+        stop();
+        for (const col of ['tx', 'rec', 'debt']) {
+          const snap = await F.getDocs(F.collection(db, 'users', u.uid, col));
+          for (let i = 0; i < snap.docs.length; i += 400) {
+            const b = F.writeBatch(db); snap.docs.slice(i, i + 400).forEach(d => b.delete(d.ref)); await b.commit();
+          }
+        }
+        await F.deleteDoc(F.doc(db, 'users', u.uid, 'meta', 'settings'));
+        await Au.deleteUser(u);
+        try { await F.terminate(db); await F.clearIndexedDbPersistence(db); } catch { /* ignora */ }
+      }
     },
     start() {
       Au.onAuthStateChanged(auth, user => {
-        stop(); S.user = user; S.authReady = true;
+        stop(); S.user = user; S.authReady = true; S.loaded = false; S.syncErr = ''; meta = {}; got = new Set();
         if (user) {
           uid = user.uid;
-          for (const col of ['tx', 'rec', 'debt']) {
-            unsubs.push(F.onSnapshot(F.collection(db, 'users', uid, col), snap => {
-              S[col] = snap.docs.map(d => ({ ...d.data(), id: d.id })); render();
-            }, err => toast('Sincronizzazione: ' + err.message)));
-          }
-          unsubs.push(F.onSnapshot(F.doc(db, 'users', uid, 'meta', 'settings'), snap => {
-            S.settings = { budgets: {}, ...(snap.data() || {}) }; render();
-          }, err => toast('Sincronizzazione: ' + err.message)));
+          for (const col of ['tx', 'rec', 'debt'])
+            watch(col, F.collection(db, 'users', uid, col), snap => { S[col] = snap.docs.map(d => ({ ...d.data(), id: d.id })); });
+          watch('settings', F.doc(db, 'users', uid, 'meta', 'settings'), snap => { S.settings = { budgets: {}, ...(snap.data() || {}) }; });
         } else {
-          uid = null; S.tx = []; S.rec = []; S.debt = []; S.settings = { budgets: {} };
+          uid = null; S.tx = []; S.rec = []; S.debt = []; S.settings = { budgets: {} }; S.authMode = 'in';
           closeSheet();
         }
         render();
       });
     },
-    add: (col, obj, id = newId()) => F.setDoc(F.doc(db, 'users', uid, col, id), obj),
-    update: (col, id, patch) => F.updateDoc(F.doc(db, 'users', uid, col, id), patch),
-    remove: (col, id) => F.deleteDoc(F.doc(db, 'users', uid, col, id)),
-    saveSettings: p => F.setDoc(F.doc(db, 'users', uid, 'meta', 'settings'), { ...S.settings, ...p }),
+    add: async (col, obj, id = newId()) => { need(); return F.setDoc(F.doc(db, 'users', uid, col, id), obj); },
+    update: async (col, id, patch) => { need(); return F.updateDoc(F.doc(db, 'users', uid, col, id), patch); },
+    remove: async (col, id) => { need(); return F.deleteDoc(F.doc(db, 'users', uid, col, id)); },
+    saveSettings: async p => { need(); return F.setDoc(F.doc(db, 'users', uid, 'meta', 'settings'), { ...S.settings, ...p }); },
     logout: () => Au.signOut(auth)
   };
 }
@@ -211,7 +267,7 @@ const allCats = () => [...new Set([...DEF_OUT, ...DEF_IN, ...S.tx.map(t => t.cat
 /* ========== viste ========== */
 const headerHTML = () => `
 <header class="top">
-  <div class="trow"><h1>Cassa</h1><button class="icon" data-act="settings" aria-label="Impostazioni">${icon('set')}</button></div>
+  <div class="trow"><div class="ttl"><h1>Cassa</h1>${S.mode === 'cloud' ? syncBadge() : ''}</div><button class="icon" data-act="settings" aria-label="Impostazioni">${icon('set')}</button></div>
   ${S.view === 'debt' ? '' : `<div class="seg scope">${[['all', 'Tutto'], ['personale', 'Personale'], ['lavoro', 'Lavoro']]
     .map(([v, l]) => `<button class="${S.scope === v ? 'on' : ''}" data-act="scope" data-v="${v}">${l}</button>`).join('')}</div>`}
 </header>`;
@@ -243,9 +299,9 @@ function quickAnalysis(tx) {
     const share = o.v / tot * 100, c = sums[0] <= sums[1] ? 0 : 1;
     cols[c].push({ name, o, share, rank }); sums[c] += share;
   });
-  const tile = ({ name, o, share, rank }) => `<button class="qt" style="--g:${Math.max(share, 6).toFixed(1)};--c:${QA_COLORS[rank]}" data-act="tab" data-view="stats">
-    <span class="qh"><span class="qi">${catIcon(name)}</span><span><b>${esc(name)}</b><small>${eur(o.v)}<br>${o.n} ${o.n === 1 ? 'movimento' : 'movimenti'}</small></span></span>
-    <span class="pc">${share < 1 ? '&lt;1' : Math.round(share)}<i>%</i></span></button>`;
+  const tile = ({ name, o, share, rank }) => `<button class="qt" style="--g:${Math.max(share, 6).toFixed(1)};--c:${QA_COLORS[rank]};--i:${rank}" data-act="tab" data-view="stats">
+    <span class="qh"><span class="qi">${catIcon(name)}</span><span><b>${esc(name)}</b><small>${cu(o.v, 'eur', '', 300 + rank * 110)}<br>${o.n} ${o.n === 1 ? 'movimento' : 'movimenti'}</small></span></span>
+    <span class="pc">${cu(share, 'pct', '', 300 + rank * 110, share < 1 ? '&lt;1' : Math.round(share))}<i>%</i></span></button>`;
   return `<div class="qa">${cols.filter(c => c.length).map(c => `<div class="qa-col">${c.map(tile).join('')}</div>`).join('')}</div>`;
 }
 
@@ -261,8 +317,8 @@ function homeView() {
   return `${monthNav()}
   <section class="hero card">
     <small>Saldo del mese</small>
-    <div class="big ${bal < 0 ? 'neg' : ''}">${eur(bal)}</div>
-    <div class="split"><div><small>Entrate</small><b class="in">${eur(inc)}</b></div><div><small>Uscite</small><b class="out">${eur(out)}</b></div></div>
+    <div class="big ${bal < 0 ? 'neg' : ''}">${cu(bal, 'eur', '', 100)}</div>
+    <div class="split"><div><small>Entrate</small><b class="in">${cu(inc, 'eur', '', 250)}</b></div><div><small>Uscite</small><b class="out">${cu(out, 'eur', '', 350)}</b></div></div>
   </section>
   ${due.length ? `<h3>Da pagare questo mese</h3><div class="card list">${due.map(x => {
     const diff = daysBetween(t0, x.due);
@@ -271,8 +327,8 @@ function homeView() {
       <span class="amt ${(x.r.type || 'out')}">${eur(x.r.amount)}</span><button class="chip" data-act="pay-rec" data-id="${x.r.id}">Fatto</button></div>`;
   }).join('')}</div>` : ''}
   <div class="two">
-    <button class="card stat" data-act="tab" data-view="debt"><small>Ti devono</small><b class="in">${eur(cred)}</b></button>
-    <button class="card stat" data-act="tab" data-view="debt"><small>Devi</small><b class="out">${eur(dbt)}</b></button>
+    <button class="card stat" data-act="tab" data-view="debt"><small>Ti devono</small><b class="in">${cu(cred, 'eur', '', 150)}</b></button>
+    <button class="card stat" data-act="tab" data-view="debt"><small>Devi</small><b class="out">${cu(dbt, 'eur', '', 250)}</b></button>
   </div>
   <h3>Ultimi movimenti</h3>
   ${recent.length ? `<div class="card list">${recent.map(txRow).join('')}</div>` : `<div class="card empty">Ancora nessun movimento.<br>Tocca + per aggiungere il primo.</div>`}
@@ -296,7 +352,7 @@ const txView = () => `${monthNav()}<input class="search" id="q" type="search" pl
 function recView() {
   const list = S.rec.filter(inScope).slice().sort((a, b) => (+a.day || 0) - (+b.day || 0));
   const fixed = sum(list.filter(r => r.active !== false && (r.type || 'out') === 'out'));
-  return `<section class="hero card"><small>Costi fissi mensili</small><div class="big">${eur(fixed)}</div>
+  return `<section class="hero card"><small>Costi fissi mensili</small><div class="big">${cu(fixed, 'eur', '', 100)}</div>
     <small>${list.filter(r => r.active !== false && (r.type || 'out') === 'out').length} pagamenti attivi</small></section>
   <h3>Pagamenti ricorrenti</h3>
   ${list.length ? `<div class="card list">${list.map(r => `<button class="item" data-act="edit-rec" data-id="${r.id}" style="${r.active === false ? 'opacity:.5' : ''}">
@@ -319,8 +375,8 @@ function debtView() {
   const cred = open.filter(d => d.dir === 'credit').reduce((s, d) => s + rem(d), 0);
   const dbt = open.filter(d => d.dir === 'debt').reduce((s, d) => s + rem(d), 0);
   return `<div class="two" style="margin-top:6px">
-    <div class="card stat"><small>Ti devono</small><b class="in">${eur(cred)}</b></div>
-    <div class="card stat"><small>Devi</small><b class="out">${eur(dbt)}</b></div></div>
+    <div class="card stat"><small>Ti devono</small><b class="in">${cu(cred, 'eur', '', 100)}</b></div>
+    <div class="card stat"><small>Devi</small><b class="out">${cu(dbt, 'eur', '', 200)}</b></div></div>
   <h3>Persone</h3>
   ${arr.length ? arr.map(g => `<div class="card grp" style="margin-bottom:12px">
     <div class="person"><b>${esc(g.name)}</b><span class="amt ${g.net > 0 ? 'in' : g.net < 0 ? 'out' : ''}">${g.net > 0 ? 'ti deve ' + eur(g.net) : g.net < 0 ? 'devi ' + eur(-g.net) : 'siete pari'}</span></div>
@@ -343,8 +399,8 @@ function chart6() {
   const bars = data.map((d, k) => {
     const gx = slot * k + (slot - (bw * 2 + 4)) / 2;
     const hi = d.i / max * avail, ho = d.o / max * avail;
-    return `<rect class="b-in" x="${gx.toFixed(1)}" y="${(base - hi).toFixed(1)}" width="${bw}" height="${hi.toFixed(1)}" rx="3"><title>Entrate ${eur(d.i)}</title></rect>
-      <rect class="b-out" x="${(gx + bw + 4).toFixed(1)}" y="${(base - ho).toFixed(1)}" width="${bw}" height="${ho.toFixed(1)}" rx="3"><title>Uscite ${eur(d.o)}</title></rect>
+    return `<rect class="b-in" style="--i:${k * 2}" x="${gx.toFixed(1)}" y="${(base - hi).toFixed(1)}" width="${bw}" height="${hi.toFixed(1)}" rx="3"><title>Entrate ${eur(d.i)}</title></rect>
+      <rect class="b-out" style="--i:${k * 2 + 1}" x="${(gx + bw + 4).toFixed(1)}" y="${(base - ho).toFixed(1)}" width="${bw}" height="${ho.toFixed(1)}" rx="3"><title>Uscite ${eur(d.o)}</title></rect>
       <text class="lbl" x="${(slot * k + slot / 2).toFixed(1)}" y="${H - 5}">${esc(monthShort(d.m))}</text>`;
   }).join('');
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Entrate e uscite degli ultimi sei mesi">${bars}</svg>`;
@@ -363,44 +419,116 @@ function statsView() {
   const wi = sum(w.filter(t => t.type === 'in')), wo = sum(w.filter(t => t.type === 'out'));
   return `${monthNav()}
   <h3>Spese per categoria</h3>
-  ${rows.length ? `<div class="card">${rows.map(([c, v]) => `<div class="brow"><div class="top2"><span class="nm">${cico(c)}<b>${esc(c)}</b></span><span class="amt">${eur(v)} <small>· ${Math.round(v / tot * 100)}%</small></span></div>
+  ${rows.length ? `<div class="card">${rows.map(([c, v], n) => `<div class="brow" style="--i:${n}"><div class="top2"><span class="nm">${cico(c)}<b>${esc(c)}</b></span><span class="amt">${cu(v, 'eur', '', n * 80)} <small>· ${cu(v / tot * 100, 'pct', '', n * 80, Math.round(v / tot * 100))}%</small></span></div>
     <div class="bar"><i style="width:${(v / tot * 100).toFixed(1)}%"></i></div></div>`).join('')}</div>`
     : `<div class="card empty">Nessuna spesa in questo mese.</div>`}
   <h3>Budget</h3>
-  <div class="card">${bRows.length ? bRows.map(b => `<div class="brow"><div class="top2"><span class="nm">${cico(b.c)}<b>${esc(b.c)}</b></span><span class="amt ${b.s > b.v ? 'out' : ''}">${eur(b.s)} <small>/ ${eur(b.v)}</small></span></div>
+  <div class="card">${bRows.length ? bRows.map((b, n) => `<div class="brow" style="--i:${n}"><div class="top2"><span class="nm">${cico(b.c)}<b>${esc(b.c)}</b></span><span class="amt ${b.s > b.v ? 'out' : ''}">${cu(b.s, 'eur', '', n * 80)} <small>/ ${eur(b.v)}</small></span></div>
     <div class="bar"><i class="${b.s > b.v ? 'over' : ''}" style="width:${Math.min(100, b.s / b.v * 100).toFixed(1)}%"></i></div></div>`).join('')
     : `<div class="empty">Nessun budget impostato.</div>`}
     <div class="brow"><button class="link" style="margin:0" data-act="budgets">${bRows.length ? 'Modifica budget' : 'Imposta budget'}</button></div></div>
   <h3>Ultimi 6 mesi</h3>
   <div class="card" style="padding:14px 10px 4px">${chart6()}<div class="legend"><span><i style="background:var(--in)"></i>Entrate</span><span><i style="background:var(--out)"></i>Uscite</span></div></div>
   <h3>Lavoro ${yr}</h3>
-  <div class="card pad"><div class="split"><div><small>Entrate</small><b class="in">${eur(wi)}</b></div><div><small>Spese</small><b class="out">${eur(wo)}</b></div><div><small>Differenza</small><b>${eur(wi - wo)}</b></div></div>
+  <div class="card pad"><div class="split"><div><small>Entrate</small><b class="in">${cu(wi, 'eur', '', 100)}</b></div><div><small>Spese</small><b class="out">${cu(wo, 'eur', '', 200)}</b></div><div><small>Differenza</small><b>${cu(wi - wo, 'eur', '', 300)}</b></div></div>
     <p class="mut" style="margin-top:10px;font-size:.85rem">Somma dei movimenti segnati come “Lavoro” nell'anno, indipendentemente dal filtro in alto.</p></div>`;
 }
 
-const loginHTML = () => `<main class="login"><div class="logo">€</div><h1>Cassa</h1>
-  <p class="mut" style="margin-top:6px">Accedi per vedere i tuoi dati su iPhone e Mac.</p>
-  <form id="lf"><label class="fld">Email<input type="email" name="email" autocomplete="username" required></label>
+const GLOGO = '<svg viewBox="0 0 48 48" width="20" height="20" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.9 6.2C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z"/><path fill="#FBBC05" d="M10.5 28.6A14.5 14.5 0 0 1 9.5 24c0-1.6.3-3.1.8-4.6l-7.9-6.2A24 24 0 0 0 0 24c0 3.9.9 7.5 2.6 10.8l7.9-6.2z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.9l-7.9 6.2C6.5 42.6 14.6 48 24 48z"/></svg>';
+const loginHTML = () => {
+  const up = S.authMode === 'up';
+  const form = up
+    ? `<form id="sf"><label class="fld">Email<input type="email" name="email" autocomplete="username" required></label>
+  <label class="fld">Password (minimo 6 caratteri)<input type="password" name="password" autocomplete="new-password" minlength="6" required></label>
+  <label class="fld">Ripeti la password<input type="password" name="password2" autocomplete="new-password" minlength="6" required></label>
+  <p id="lerr" class="err" role="alert"></p>
+  <button class="btn primary">Crea account e accedi</button>
+  <p class="hint">Dopo la creazione entri subito nell'app. Per vedere gli stessi dati su un altro dispositivo, accedi con questa stessa email.</p></form>`
+    : `<form id="lf"><label class="fld">Email<input type="email" name="email" autocomplete="username" required></label>
   <label class="fld">Password<input type="password" name="password" autocomplete="current-password" minlength="6" required></label>
   <p id="lerr" class="err" role="alert"></p>
   <button class="btn primary">Accedi</button>
-  <button type="button" class="btn" data-act="signup">Crea account</button>
-  <button type="button" class="link" data-act="reset">Password dimenticata?</button></form></main>`;
+  <button type="button" class="link" data-act="reset">Password dimenticata?</button></form>`;
+  return `<main class="login" data-mode="${up ? 'up' : 'in'}"><img class="logo" src="icons/icon-192.png" alt="" width="76" height="76"><h1>Cassa</h1>
+  <p class="mut" style="margin-top:6px">${up ? 'Crea il tuo account personale.' : 'Accedi per vedere i tuoi dati su iPhone e Mac.'}</p>
+  <div class="seg authseg"><button type="button" class="${up ? '' : 'on'}" data-act="auth-mode" data-v="in">Accedi</button><button type="button" class="${up ? 'on' : ''}" data-act="auth-mode" data-v="up">Crea account</button></div>
+  <button type="button" class="btn gbtn" data-act="google">${GLOGO}<span>Continua con Google</span></button>
+  <div class="or"><span>oppure con email</span></div>
+  ${form}</main>`;
+};
 
+/* ===== stato di sincronizzazione ===== */
+const SYNC_LABEL = { ok: 'Sincronizzato', wait: 'Sincronizzo…', off: 'Offline', err: 'Errore' };
+const syncBadge = () => `<span id="syncb" class="sync ${S.sync}"><i></i><em>${SYNC_LABEL[S.sync]}</em></span>`;
+const syncText = () => ({
+  ok: 'Tutto salvato nel cloud. I dati compaiono su ogni dispositivo in cui accedi con questo stesso account.',
+  wait: 'Sto inviando o scaricando i dati. Le modifiche sono già salvate su questo dispositivo e saranno inviate appena possibile.',
+  off: 'Sei offline: le modifiche restano salvate su questo dispositivo e partiranno appena torna la connessione.',
+  err: `I dati non arrivano al cloud (${esc(S.syncErr)}). Controlla le regole di Firestore e che il dominio sia autorizzato.`
+}[S.sync]);
+function setSync(v) {
+  S.sync = v;
+  const b = $('#syncb'); if (b) { b.className = 'sync ' + v; $('em', b).textContent = SYNC_LABEL[v]; }
+  const m = $('#syncmsg'); if (m) { m.innerHTML = syncText(); m.className = 'mut sync-' + v; }
+}
+
+/* ===== animazioni: numeri che scorrono ===== */
+const RM = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+const lastVals = new Map();
+const ease = t => 1 - Math.pow(1 - t, 3);
+function countUp(el, from, to, dur, delay) {
+  const k = el.dataset.k, pre = el.dataset.p || '', final = el.innerHTML;
+  const fmt = x => k === 'pct' ? String(Math.round(x)) : pre + eur(x);
+  el.textContent = fmt(from);
+  const t0 = performance.now() + delay;
+  const step = now => {
+    if (!el.isConnected) return;
+    const t = Math.min(1, Math.max(0, (now - t0) / dur));
+    if (t >= 1) { el.innerHTML = final; return; }
+    el.textContent = fmt(from + (to - from) * ease(t));
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+function animateNumbers(enter) {
+  document.querySelectorAll('#app .cu').forEach((el, i) => {
+    const v = +el.dataset.v, key = S.view + ':' + i;
+    const from = enter ? 0 : (lastVals.has(key) ? lastVals.get(key) : v);
+    lastVals.set(key, v);
+    if (RM || from === v) return;
+    countUp(el, from, v, enter ? 1000 : 650, enter ? (+el.dataset.d || 0) : 0);
+  });
+}
+
+let lastSig = '', lastKey = '';
 function render() {
   const app = $('#app'), y = window.scrollY;
   if (S.fatal) {
-    app.innerHTML = `<main class="login"><div class="logo">€</div><h1>Cassa</h1><p class="err">${esc(S.fatal)}</p><button class="btn primary" data-act="retry">Riprova</button></main>`;
+    app.innerHTML = `<main class="login"><img class="logo" src="icons/icon-192.png" alt="" width="76" height="76"><h1>Cassa</h1><p class="err">${esc(S.fatal)}</p><button class="btn primary" data-act="retry">Riprova</button></main>`;
     return;
   }
   if (S.mode === 'cloud') {
     if (!S.authReady) { app.innerHTML = '<div class="splash">Caricamento…</div>'; return; }
-    if (!S.user) { if (!$('#lf', app)) app.innerHTML = loginHTML(); return; }
+    if (!S.user) {
+      lastSig = '';
+      const m = $('.login', app);
+      if (!m || m.dataset.mode !== S.authMode) app.innerHTML = loginHTML();
+      return;
+    }
+    if (!S.loaded) { if (!$('.splash', app)) app.innerHTML = '<div class="splash">Sincronizzo i tuoi dati…</div>'; return; }
   }
+  const hadNav = !!$('nav.tabs', app);
+  const sig = JSON.stringify([S.view, S.ym, S.scope, S.search, S.showSettled, S.user && S.user.uid, S.tx, S.rec, S.debt, S.settings]);
+  if (hadNav && sig === lastSig) return; // nulla è cambiato: non ridisegnare (evita di rilanciare le animazioni)
+  lastSig = sig;
+  const key = `${S.view}|${S.ym}|${S.scope}`;
+  const enter = !hadNav || key !== lastKey; lastKey = key;
   const views = { home: homeView, tx: txView, rec: recView, debt: debtView, stats: statsView };
   const focused = document.activeElement && document.activeElement.id === 'q';
-  app.innerHTML = headerHTML() + `<main>${views[S.view]()}</main>` + navHTML() + fabHTML();
-  window.scrollTo(0, y);
+  app.innerHTML = headerHTML() + `<main class="${enter && !RM ? 'enter' : ''}">${views[S.view]()}</main>` + navHTML() + fabHTML();
+  if (enter) [...$('main', app).children].forEach((c, i) => c.style.setProperty('--i', Math.min(i, 9)));
+  animateNumbers(enter);
+  window.scrollTo(0, enter ? 0 : y);
   if (focused) { const q = $('#q'); q.focus(); q.setSelectionRange(q.value.length, q.value.length); }
 }
 
@@ -667,18 +795,35 @@ function budgetSheet() {
 
 function settingsSheet() {
   const cloud = S.mode === 'cloud';
-  openSheet('Impostazioni', `<div class="card pad"><b>${cloud ? 'Sincronizzazione attiva' : 'Modalità locale'}</b>
-    <p class="mut">${cloud ? `Collegato come ${esc(S.user?.email || '')}. I dati si aggiornano su tutti i tuoi dispositivi.`
-      : 'I dati restano solo su questo dispositivo. Per sincronizzare iPhone e Mac segui la guida nel file README.'}</p></div>
+  const prov = cloud ? store.auth.providers() : [];
+  const via = [prov.includes('google.com') ? 'Google' : '', prov.includes('password') ? 'email e password' : ''].filter(Boolean).join(' + ');
+  openSheet('Impostazioni', `<div class="card pad"><b>${cloud ? 'Account' : 'Modalità locale'}</b>
+    ${cloud ? `<p class="acct">${esc(S.user?.email || '')}</p><small>Accesso con ${esc(via || '—')}</small>
+      <p id="syncmsg" class="mut sync-${S.sync}" style="margin-top:10px">${syncText()}</p>`
+      : '<p class="mut">I dati restano solo su questo dispositivo. Per sincronizzare iPhone e Mac segui la guida nel file README.</p>'}</div>
     <h3>Dati</h3>
     <div class="card list">
       <button class="item" data-act="export-csv"><span class="mid"><b>Esporta movimenti (CSV)</b><small>Si apre con Excel o Numbers</small></span></button>
       <button class="item" data-act="export-json"><span class="mid"><b>Backup completo (JSON)</b><small>Movimenti, ricorrenti, debiti e budget</small></span></button>
       <label class="item" style="cursor:pointer"><span class="mid"><b>Ripristina da backup</b><small>Aggiunge i dati del file a quelli esistenti</small></span><input type="file" id="imp" accept=".json,application/json" hidden></label>
     </div>
-    ${cloud ? '<div class="actions"><button class="btn danger" data-act="logout">Esci dall\'account</button></div>' : ''}`,
+    ${cloud ? `<div class="actions"><button class="btn" data-act="logout" style="flex:1">Esci dall'account</button></div>
+      <div class="actions" style="margin-top:10px"><button class="btn danger" data-act="delete-account" style="flex:1">Elimina account…</button></div>` : ''}`,
   el => $('#imp', el).addEventListener('change', importJSON));
 }
+
+function deleteAccountSheet() {
+  const prov = store.auth.providers(), pw = prov.includes('password'), g = prov.includes('google.com');
+  openSheet('Elimina account', `<div class="card pad"><b>Questa azione è definitiva</b>
+    <p class="mut">Verranno cancellati l'account <b>${esc(S.user?.email || '')}</b> e tutti i suoi dati (movimenti, ricorrenti, debiti, budget) da tutti i dispositivi. Non si può annullare. Se ti serve una copia, esporta prima il backup dalle impostazioni.</p></div>
+    <form id="df">
+    ${pw ? '<label class="fld">Password dell\'account<input type="password" name="password" autocomplete="current-password"></label>' : ''}
+    <label class="fld">Scrivi ELIMINA per confermare<input name="confirm" autocomplete="off" autocapitalize="characters" required></label>
+    <p id="derr" class="err" role="alert"></p>
+    ${g ? `<p class="hint" style="text-align:left">${pw ? 'Lascia vuota la password per confermare con Google.' : 'Ti verrà chiesto di confermare con Google.'}</p>` : ''}
+    <div class="actions"><button type="button" class="btn" data-act="close">Annulla</button><button class="btn danger" style="flex:1">Elimina definitivamente</button></div></form>`);
+}
+
 
 /* ========== esporta / importa ========== */
 function download(name, text, type) {
@@ -709,23 +854,45 @@ async function importJSON(e) {
 }
 
 /* ========== accesso ========== */
-const authMsg = x => ({
+const AUTH_MSG = {
   'auth/invalid-credential': 'Email o password errate.', 'auth/wrong-password': 'Email o password errate.', 'auth/user-not-found': 'Email o password errate.',
-  'auth/invalid-email': 'Email non valida.', 'auth/email-already-in-use': 'Esiste già un account con questa email.',
+  'auth/invalid-email': 'Email non valida.', 'auth/email-already-in-use': 'Esiste già un account con questa email: tocca "Accedi".',
   'auth/weak-password': 'Password troppo corta (minimo 6 caratteri).', 'auth/too-many-requests': 'Troppi tentativi. Riprova tra qualche minuto.',
-  'auth/network-request-failed': 'Nessuna connessione.', 'auth/missing-password': 'Inserisci la password.'
-}[x.code] || ('Errore: ' + (x.message || x.code)));
+  'auth/network-request-failed': 'Nessuna connessione.', 'auth/missing-password': 'Inserisci la password.',
+  'auth/popup-closed-by-user': '', 'auth/cancelled-popup-request': '', 'auth/user-cancelled': '',
+  'auth/popup-blocked': 'Il popup di Google è stato bloccato. Consentilo e riprova.',
+  'auth/unauthorized-domain': 'Questo indirizzo non è autorizzato: in Firebase aggiungilo in Authentication → Impostazioni → Domini autorizzati.',
+  'auth/operation-not-allowed': 'Questo metodo di accesso non è attivo in Firebase.',
+  'auth/account-exists-with-different-credential': 'Esiste già un account con questa email: accedi con l\'altro metodo.',
+  'auth/requires-recent-login': 'Per sicurezza devi confermare di nuovo l\'accesso.', 'auth/user-mismatch': 'Hai confermato con un account diverso.'
+};
+const authMsg = x => (x && x.code in AUTH_MSG) ? AUTH_MSG[x.code] : ('Errore: ' + (x.message || x.code));
 async function doAuth(fn) {
-  const err = $('#lerr'); err.textContent = '';
-  try { await fn(); } catch (x) { err.textContent = authMsg(x); }
+  const err = $('#lerr'); if (err) err.textContent = '';
+  const btns = [...document.querySelectorAll('.login .btn')]; btns.forEach(b => { b.disabled = true; });
+  try { await fn(); } catch (x) { const e2 = $('#lerr'); if (e2) e2.textContent = authMsg(x); }
+  finally { btns.forEach(b => { b.disabled = false; }); }
 }
-const loginVals = () => { const f = new FormData($('#lf')); return [String(f.get('email') || '').trim(), String(f.get('password') || '')]; };
+const loginVals = () => { const f = new FormData($('#lf') || $('#sf')); return [String(f.get('email') || '').trim(), String(f.get('password') || '')]; };
 
 /* ========== eventi ========== */
 document.addEventListener('submit', e => {
   e.preventDefault();
   const id = e.target.id;
   if (id === 'lf') { const [em, pw] = loginVals(); doAuth(() => store.auth.signIn(em, pw)); }
+  else if (id === 'sf') {
+    const [em, pw] = loginVals(), pw2 = String(new FormData(e.target).get('password2') || '');
+    if (pw !== pw2) { $('#lerr').textContent = 'Le due password non coincidono.'; return; }
+    doAuth(() => store.auth.signUp(em, pw)); // appena creato l'account si entra subito nell'app
+  } else if (id === 'df') {
+    const f = new FormData(e.target), err = $('#derr'), pw = String(f.get('password') || '');
+    if (String(f.get('confirm') || '').trim().toUpperCase() !== 'ELIMINA') { err.textContent = 'Scrivi ELIMINA per confermare.'; return; }
+    if (!pw && !store.auth.providers().includes('google.com')) { err.textContent = 'Inserisci la password.'; return; }
+    err.textContent = '';
+    const btns = [...e.target.querySelectorAll('.btn')]; btns.forEach(b => { b.disabled = true; });
+    store.auth.deleteAccount(pw).then(() => { toast('Account eliminato'); setTimeout(() => location.reload(), 900); })
+      .catch(x => { err.textContent = authMsg(x); btns.forEach(b => { b.disabled = false; }); });
+  }
   else if (id === 'pf') {
     const d = S.debt.find(x => x.id === S.curDebt), v = parseAmt($('#payamt').value);
     if (!d) return;
@@ -771,8 +938,12 @@ document.addEventListener('click', e => {
     case 'close': closeSheet(); break;
     case 'export-csv': exportCSV(); break;
     case 'export-json': exportJSON(); break;
-    case 'logout': closeSheet(); run(store.logout()); break;
-    case 'signup': { const [em, pw] = loginVals(); doAuth(() => store.auth.signUp(em, pw)); break; }
+    case 'logout':
+      if (S.sync === 'wait' && !confirm('Alcune modifiche non sono ancora state inviate al cloud. Uscire comunque?')) break;
+      closeSheet(); run(store.logout()); break;
+    case 'auth-mode': S.authMode = el.dataset.v; render(); break;
+    case 'google': doAuth(() => store.auth.google()); break;
+    case 'delete-account': deleteAccountSheet(); break;
     case 'reset': {
       const [em] = loginVals();
       if (!em) { $('#lerr').textContent = 'Scrivi prima la tua email.'; break; }
@@ -801,6 +972,8 @@ async function boot() {
   store.start();
 }
 boot();
+// chiede al browser di non cancellare i dati dell'app quando serve spazio
+try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch { /* ignora */ }
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => { }));
