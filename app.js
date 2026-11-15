@@ -144,6 +144,9 @@ function localStore() {
 }
 
 /* ========== archivio: cloud (Firebase) ========== */
+// Nome del database Firestore. Il tuo si chiama "default" (senza parentesi): se un giorno ne crei uno
+// chiamato "(default)", scrivi databaseId: "(default)" in config.js.
+const DB_ID = firebaseConfig.databaseId || 'default';
 async function firebaseStore() {
   const base = 'https://www.gstatic.com/firebasejs/10.14.1/';
   const [A, Au, F] = await Promise.all([
@@ -160,8 +163,8 @@ async function firebaseStore() {
       ignoreUndefinedProperties: true,
       // con VPN, proxy e blocchi dei contenuti la connessione "a flusso" resta appesa: si usano richieste normali
       experimentalForceLongPolling: true
-    });
-  } catch (e) { console.warn(e); db = F.getFirestore(app); }
+    }, DB_ID);
+  } catch (e) { console.warn(e); db = F.getFirestore(app, DB_ID); }
   let unsubs = [], uid = null, meta = {}, got = new Set();
   const stop = () => { unsubs.forEach(u => u()); unsubs = []; };
   const gProvider = () => new Au.GoogleAuthProvider();
@@ -481,14 +484,14 @@ function setSync(v) {
 }
 
 async function probeFirestore() {
-  const u = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/users/diag/tx?pageSize=1&key=${encodeURIComponent(firebaseConfig.apiKey)}`;
+  const u = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/${encodeURIComponent(DB_ID)}/documents/users/diag/tx?pageSize=1&key=${encodeURIComponent(firebaseConfig.apiKey)}`;
   const c = new AbortController(), t = setTimeout(() => c.abort(), 8000);
   try {
     const r = await fetch(u, { signal: c.signal, cache: 'no-store' });
     let j = {}; try { j = await r.json(); } catch { /* ignora */ }
     const raw = JSON.stringify(j), m = (j.error && j.error.message) || '';
     if (/has not been used|SERVICE_DISABLED|is disabled/i.test(raw)) return { ok: false, msg: 'L\'API di Cloud Firestore è disattivata per il progetto: in Google Cloud Console → API e servizi → abilita "Cloud Firestore API".' };
-    if (r.status === 404 || /does not exist|NOT_FOUND/i.test(raw)) return { ok: false, msg: 'Il database Firestore non esiste in questo progetto: in Firebase vai su Firestore Database e crealo (edizione Standard, nome "(default)").' };
+    if (r.status === 404 || /does not exist|NOT_FOUND/i.test(raw)) return { ok: false, msg: 'Il database Firestore "' + DB_ID + '" non esiste in questo progetto: controlla il nome in Firebase → Firestore Database (in alto, accanto a "Database").' };
     if (/API key/i.test(m)) return { ok: false, msg: 'La chiave API non è accettata: controlla che i valori in config.js siano esatti e le restrizioni della chiave in Google Cloud.' };
     if (r.ok || /insufficient permissions|PERMISSION_DENIED/i.test(raw)) return { ok: true, msg: 'Il database Firestore esiste e risponde, con le regole attive.' };
     return { ok: false, msg: 'Risposta inattesa da Firestore (' + r.status + ') ' + m };
