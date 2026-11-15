@@ -450,7 +450,7 @@ const loginHTML = () => {
   <button class="btn primary">Accedi</button>
   <button type="button" class="link" data-act="reset">Password dimenticata?</button></form>`;
   return `<main class="login" data-mode="${up ? 'up' : 'in'}"><img class="logo" src="icons/icon-192.png" alt="" width="76" height="76"><h1>Cassa</h1>
-  <p class="mut" style="margin-top:6px">${up ? 'Crea il tuo account personale.' : 'Accedi al tuo account.'}</p>
+  <p class="mut" style="margin-top:6px">${up ? 'Crea il tuo account personale.' : 'Accedi per vedere i tuoi dati su iPhone e Mac.'}</p>
   <div class="seg authseg"><button type="button" class="${up ? '' : 'on'}" data-act="auth-mode" data-v="in">Accedi</button><button type="button" class="${up ? 'on' : ''}" data-act="auth-mode" data-v="up">Crea account</button></div>
   <button type="button" class="btn gbtn" data-act="google">${GLOGO}<span>Continua con Google</span></button>
   <div class="or"><span>oppure con email</span></div>
@@ -465,7 +465,7 @@ const syncBadge = () => `<span id="syncb" class="sync ${S.sync}"><i></i><em>${SY
 const syncText = () => ({
   ok: 'Tutto salvato nel cloud. I dati compaiono su ogni dispositivo in cui accedi con questo stesso account.',
   wait: 'Sto inviando o scaricando i dati. Le modifiche sono già salvate su questo dispositivo e saranno inviate appena possibile.',
-  slow: 'Il server non risponde: i dati sono al sicuro su questo dispositivo ma non sono ancora nel cloud. Se usi una VPN o un blocco dei contenuti, prova "Controlla connessione" qui sotto o aggiungi un\'eccezione per Safari/Cassa.',
+  slow: 'Il server non risponde: i dati sono al sicuro su questo dispositivo ma non sono ancora nel cloud.' + (S.probe ? ` <b>${esc(S.probe.msg)}</b>` : '') + ' Tocca "Controlla connessione" qui sotto per i dettagli.',
   off: 'Sei offline: le modifiche restano salvate su questo dispositivo e partiranno appena torna la connessione.',
   err: `I dati non arrivano al cloud (${esc(S.syncErr)}). Controlla le regole di Firestore e che il dominio sia autorizzato.`
 }[S.sync]);
@@ -473,11 +473,27 @@ let slowTimer = null;
 function setSync(v) {
   if (v === 'wait') {
     if (S.sync === 'slow') v = 'slow';
-    else if (!slowTimer) slowTimer = setTimeout(() => { slowTimer = null; if (S.sync === 'wait') setSync('slow'); }, 10000);
+    else if (!slowTimer) slowTimer = setTimeout(() => { slowTimer = null; if (S.sync === 'wait') { setSync('slow'); probeFirestore().then(r => { S.probe = r; const m = $('#syncmsg'); if (m) m.innerHTML = syncText(); }); } }, 10000);
   } else { clearTimeout(slowTimer); slowTimer = null; }
   S.sync = v;
   const b = $('#syncb'); if (b) { b.className = 'sync ' + v; $('em', b).textContent = SYNC_LABEL[v]; }
   const m = $('#syncmsg'); if (m) { m.innerHTML = syncText(); m.className = 'mut sync-' + v; }
+}
+
+async function probeFirestore() {
+  const u = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/users/diag/tx?pageSize=1&key=${encodeURIComponent(firebaseConfig.apiKey)}`;
+  const c = new AbortController(), t = setTimeout(() => c.abort(), 8000);
+  try {
+    const r = await fetch(u, { signal: c.signal, cache: 'no-store' });
+    let j = {}; try { j = await r.json(); } catch { /* ignora */ }
+    const raw = JSON.stringify(j), m = (j.error && j.error.message) || '';
+    if (/has not been used|SERVICE_DISABLED|is disabled/i.test(raw)) return { ok: false, msg: 'L\'API di Cloud Firestore è disattivata per il progetto: in Google Cloud Console → API e servizi → abilita "Cloud Firestore API".' };
+    if (r.status === 404 || /does not exist|NOT_FOUND/i.test(raw)) return { ok: false, msg: 'Il database Firestore non esiste in questo progetto: in Firebase vai su Firestore Database e crealo (edizione Standard, nome "(default)").' };
+    if (/API key/i.test(m)) return { ok: false, msg: 'La chiave API non è accettata: controlla che i valori in config.js siano esatti e le restrizioni della chiave in Google Cloud.' };
+    if (r.ok || /insufficient permissions|PERMISSION_DENIED/i.test(raw)) return { ok: true, msg: 'Il database Firestore esiste e risponde, con le regole attive.' };
+    return { ok: false, msg: 'Risposta inattesa da Firestore (' + r.status + ') ' + m };
+  } catch { return { ok: false, msg: 'Non riesco a raggiungere Firestore da questo dispositivo (rete, VPN o blocco dei contenuti).' }; }
+  finally { clearTimeout(t); }
 }
 
 /* ===== diagnosi connessione: dice quali servizi Google non rispondono (utile con VPN) ===== */
@@ -491,9 +507,11 @@ async function checkConn(box) {
     try { await fetch(u, { mode: 'no-cors', cache: 'no-store', signal: c.signal }); return [n, true]; }
     catch { return [n, false]; } finally { clearTimeout(t); }
   }));
+  const pr = await probeFirestore(); S.probe = pr;
   const bad = res.filter(r => !r[1]).length;
   box.innerHTML = `<ul class="dg">${res.map(([n, k]) => `<li class="${k ? 'y' : 'n'}">${k ? '✓' : '✕'} ${n}</li>`).join('')}</ul>
-    <p class="mut">${bad ? 'Alcuni servizi non rispondono: è tipico di VPN con blocco di tracker/pubblicità o filtri DNS. Nelle impostazioni della VPN disattiva quel filtro (es. "Threat Protection", "CyberSec", "Tracker blocker") oppure escludi Safari/Cassa dalla VPN (split tunneling). Poi riprova.' : 'La rete raggiunge tutti i servizi. Se l\'accesso non va, riprova tra poco.'}</p>`;
+    <p class="${pr.ok ? 'dgok' : 'dgbad'}">${pr.ok ? '✓' : '✕'} ${esc(pr.msg)}</p>
+    ${pr.ok && !bad ? '' : `<p class="mut">${bad ? 'Alcuni servizi non rispondono: è tipico di VPN con blocco di tracker/pubblicità o filtri DNS. Nelle impostazioni della VPN disattiva quel filtro (es. "Threat Protection", "CyberSec", "Tracker blocker") oppure escludi Safari/Cassa dalla VPN (split tunneling). Poi riprova.' : 'La rete raggiunge tutti i servizi. Se l\'accesso non va, riprova tra poco.'}</p>`}`;
 }
 
 /* ===== animazioni: numeri che scorrono ===== */
