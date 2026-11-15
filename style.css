@@ -232,3 +232,11 @@ p.sync-err{color:var(--out)}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
 }
+
+/* diagnosi connessione */
+.diag{text-align:left;margin-top:12px;font-size:.8rem}
+.dg{list-style:none;padding:0;margin:0 0 8px;font-weight:700}
+.dg li.y{color:var(--in)}.dg li.n{color:var(--out)}
+.sync.slow i{background:#e0a21a}
+.sync.slow{color:#b9801a}
+p.sync-slow{color:var(--ink)}

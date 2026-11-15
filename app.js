@@ -158,8 +158,8 @@ async function firebaseStore() {
     db = F.initializeFirestore(app, {
       localCache: F.persistentLocalCache({ tabManager: F.persistentMultipleTabManager() }),
       ignoreUndefinedProperties: true,
-      // aiuta con VPN, proxy e blocchi dei contenuti, che a volte impediscono l'invio dei dati
-      experimentalAutoDetectLongPolling: true
+      // con VPN, proxy e blocchi dei contenuti la connessione "a flusso" resta appesa: si usano richieste normali
+      experimentalForceLongPolling: true
     });
   } catch (e) { console.warn(e); db = F.getFirestore(app); }
   let unsubs = [], uid = null, meta = {}, got = new Set();
@@ -438,38 +438,62 @@ const GLOGO = '<svg viewBox="0 0 48 48" width="20" height="20" aria-hidden="true
 const loginHTML = () => {
   const up = S.authMode === 'up';
   const form = up
-    ? `<form id="sf"><label class="fld">Email<input type="email" name="email" autocomplete="username" required></label>
-  <label class="fld">Password (minimo 6 caratteri)<input type="password" name="password" autocomplete="new-password" minlength="6" required></label>
-  <label class="fld">Ripeti la password<input type="password" name="password2" autocomplete="new-password" minlength="6" required></label>
+    ? `<form id="sf" novalidate><label class="fld">Email<input type="email" name="email" autocomplete="username" required></label>
+  <label class="fld">Password (minimo 6 caratteri)<input type="password" name="password" autocomplete="new-password" required></label>
+  <label class="fld">Ripeti la password<input type="password" name="password2" autocomplete="new-password" required></label>
   <p id="lerr" class="err" role="alert"></p>
   <button class="btn primary">Crea account e accedi</button>
   <p class="hint">Dopo la creazione entri subito nell'app. Per vedere gli stessi dati su un altro dispositivo, accedi con questa stessa email.</p></form>`
-    : `<form id="lf"><label class="fld">Email<input type="email" name="email" autocomplete="username" required></label>
-  <label class="fld">Password<input type="password" name="password" autocomplete="current-password" minlength="6" required></label>
+    : `<form id="lf" novalidate><label class="fld">Email<input type="email" name="email" autocomplete="username" required></label>
+  <label class="fld">Password<input type="password" name="password" autocomplete="current-password" required></label>
   <p id="lerr" class="err" role="alert"></p>
   <button class="btn primary">Accedi</button>
   <button type="button" class="link" data-act="reset">Password dimenticata?</button></form>`;
   return `<main class="login" data-mode="${up ? 'up' : 'in'}"><img class="logo" src="icons/icon-192.png" alt="" width="76" height="76"><h1>Cassa</h1>
-  <p class="mut" style="margin-top:6px">${up ? 'Crea il tuo account personale.' : 'Accedi per vedere i tuoi dati su iPhone e Mac.'}</p>
+  <p class="mut" style="margin-top:6px">${up ? 'Crea il tuo account personale.' : 'Accedi al tuo account.'}</p>
   <div class="seg authseg"><button type="button" class="${up ? '' : 'on'}" data-act="auth-mode" data-v="in">Accedi</button><button type="button" class="${up ? 'on' : ''}" data-act="auth-mode" data-v="up">Crea account</button></div>
   <button type="button" class="btn gbtn" data-act="google">${GLOGO}<span>Continua con Google</span></button>
   <div class="or"><span>oppure con email</span></div>
-  ${form}</main>`;
+  ${form}
+  <button type="button" class="link" data-act="diag" style="margin-top:22px">Non riesci ad accedere? Controlla la connessione</button>
+  <div id="diag" class="diag" aria-live="polite"></div></main>`;
 };
 
 /* ===== stato di sincronizzazione ===== */
-const SYNC_LABEL = { ok: 'Sincronizzato', wait: 'Sincronizzo…', off: 'Offline', err: 'Errore' };
+const SYNC_LABEL = { ok: 'Sincronizzato', wait: 'Sincronizzo…', slow: 'Connessione lenta', off: 'Offline', err: 'Errore' };
 const syncBadge = () => `<span id="syncb" class="sync ${S.sync}"><i></i><em>${SYNC_LABEL[S.sync]}</em></span>`;
 const syncText = () => ({
   ok: 'Tutto salvato nel cloud. I dati compaiono su ogni dispositivo in cui accedi con questo stesso account.',
   wait: 'Sto inviando o scaricando i dati. Le modifiche sono già salvate su questo dispositivo e saranno inviate appena possibile.',
+  slow: 'Il server non risponde: i dati sono al sicuro su questo dispositivo ma non sono ancora nel cloud. Se usi una VPN o un blocco dei contenuti, prova "Controlla connessione" qui sotto o aggiungi un\'eccezione per Safari/Cassa.',
   off: 'Sei offline: le modifiche restano salvate su questo dispositivo e partiranno appena torna la connessione.',
   err: `I dati non arrivano al cloud (${esc(S.syncErr)}). Controlla le regole di Firestore e che il dominio sia autorizzato.`
 }[S.sync]);
+let slowTimer = null;
 function setSync(v) {
+  if (v === 'wait') {
+    if (S.sync === 'slow') v = 'slow';
+    else if (!slowTimer) slowTimer = setTimeout(() => { slowTimer = null; if (S.sync === 'wait') setSync('slow'); }, 10000);
+  } else { clearTimeout(slowTimer); slowTimer = null; }
   S.sync = v;
   const b = $('#syncb'); if (b) { b.className = 'sync ' + v; $('em', b).textContent = SYNC_LABEL[v]; }
   const m = $('#syncmsg'); if (m) { m.innerHTML = syncText(); m.className = 'mut sync-' + v; }
+}
+
+/* ===== diagnosi connessione: dice quali servizi Google non rispondono (utile con VPN) ===== */
+async function checkConn(box) {
+  box.innerHTML = '<p class="mut">Controllo in corso…</p>';
+  const host = firebaseConfig.authDomain || 'firebaseapp.com';
+  const T = [['Accesso (Firebase Auth)', 'https://identitytoolkit.googleapis.com/'], ['Sessione', 'https://securetoken.googleapis.com/'],
+    ['Database (Firestore)', 'https://firestore.googleapis.com/'], ['Librerie', 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js'], ['Pagina di accesso', 'https://' + host + '/']];
+  const res = await Promise.all(T.map(async ([n, u]) => {
+    const c = new AbortController(), t = setTimeout(() => c.abort(), 7000);
+    try { await fetch(u, { mode: 'no-cors', cache: 'no-store', signal: c.signal }); return [n, true]; }
+    catch { return [n, false]; } finally { clearTimeout(t); }
+  }));
+  const bad = res.filter(r => !r[1]).length;
+  box.innerHTML = `<ul class="dg">${res.map(([n, k]) => `<li class="${k ? 'y' : 'n'}">${k ? '✓' : '✕'} ${n}</li>`).join('')}</ul>
+    <p class="mut">${bad ? 'Alcuni servizi non rispondono: è tipico di VPN con blocco di tracker/pubblicità o filtri DNS. Nelle impostazioni della VPN disattiva quel filtro (es. "Threat Protection", "CyberSec", "Tracker blocker") oppure escludi Safari/Cassa dalla VPN (split tunneling). Poi riprova.' : 'La rete raggiunge tutti i servizi. Se l\'accesso non va, riprova tra poco.'}</p>`;
 }
 
 /* ===== animazioni: numeri che scorrono ===== */
@@ -807,7 +831,8 @@ function settingsSheet() {
       <button class="item" data-act="export-json"><span class="mid"><b>Backup completo (JSON)</b><small>Movimenti, ricorrenti, debiti e budget</small></span></button>
       <label class="item" style="cursor:pointer"><span class="mid"><b>Ripristina da backup</b><small>Aggiunge i dati del file a quelli esistenti</small></span><input type="file" id="imp" accept=".json,application/json" hidden></label>
     </div>
-    ${cloud ? `<div class="actions"><button class="btn" data-act="logout" style="flex:1">Esci dall'account</button></div>
+    ${cloud ? `<div class="actions"><button class="btn" data-act="diag" style="flex:1">Controlla connessione</button></div><div id="diag2" class="diag"></div>
+      <div class="actions" style="margin-top:10px"><button class="btn" data-act="logout" style="flex:1">Esci dall'account</button></div>
       <div class="actions" style="margin-top:10px"><button class="btn danger" data-act="delete-account" style="flex:1">Elimina account…</button></div>` : ''}`,
   el => $('#imp', el).addEventListener('change', importJSON));
 }
@@ -859,7 +884,7 @@ const AUTH_MSG = {
   'auth/invalid-email': 'Email non valida.', 'auth/email-already-in-use': 'Esiste già un account con questa email: tocca "Accedi".',
   'auth/weak-password': 'Password troppo corta (minimo 6 caratteri).', 'auth/too-many-requests': 'Troppi tentativi. Riprova tra qualche minuto.',
   'auth/network-request-failed': 'Nessuna connessione.', 'auth/missing-password': 'Inserisci la password.',
-  'auth/popup-closed-by-user': '', 'auth/cancelled-popup-request': '', 'auth/user-cancelled': '',
+  'app/timeout': 'Nessuna risposta dal server. Se usi una VPN, tocca "Controlla la connessione" qui sotto.', 'auth/popup-closed-by-user': '', 'auth/cancelled-popup-request': '', 'auth/user-cancelled': '',
   'auth/popup-blocked': 'Il popup di Google è stato bloccato. Consentilo e riprova.',
   'auth/unauthorized-domain': 'Questo indirizzo non è autorizzato: in Firebase aggiungilo in Authentication → Impostazioni → Domini autorizzati.',
   'auth/operation-not-allowed': 'Questo metodo di accesso non è attivo in Firebase.',
@@ -870,8 +895,12 @@ const authMsg = x => (x && x.code in AUTH_MSG) ? AUTH_MSG[x.code] : ('Errore: ' 
 async function doAuth(fn) {
   const err = $('#lerr'); if (err) err.textContent = '';
   const btns = [...document.querySelectorAll('.login .btn')]; btns.forEach(b => { b.disabled = true; });
-  try { await fn(); } catch (x) { const e2 = $('#lerr'); if (e2) e2.textContent = authMsg(x); }
-  finally { btns.forEach(b => { b.disabled = false; }); }
+  const pb = $('.login .btn.primary'), lbl = pb && pb.textContent; if (pb) pb.textContent = 'Attendi…';
+  let to;
+  try {
+    await Promise.race([fn(), new Promise((_, rej) => { to = setTimeout(() => rej({ code: 'app/timeout' }), 20000); })]);
+  } catch (x) { const e2 = $('#lerr'); if (e2) e2.textContent = authMsg(x); }
+  finally { clearTimeout(to); btns.forEach(b => { b.disabled = false; }); if (pb && pb.isConnected) pb.textContent = lbl; }
 }
 const loginVals = () => { const f = new FormData($('#lf') || $('#sf')); return [String(f.get('email') || '').trim(), String(f.get('password') || '')]; };
 
@@ -879,9 +908,15 @@ const loginVals = () => { const f = new FormData($('#lf') || $('#sf')); return [
 document.addEventListener('submit', e => {
   e.preventDefault();
   const id = e.target.id;
-  if (id === 'lf') { const [em, pw] = loginVals(); doAuth(() => store.auth.signIn(em, pw)); }
+  if (id === 'lf') {
+    const [em, pw] = loginVals();
+    if (!em || !pw) { $('#lerr').textContent = 'Inserisci email e password.'; return; }
+    doAuth(() => store.auth.signIn(em, pw));
+  }
   else if (id === 'sf') {
     const [em, pw] = loginVals(), pw2 = String(new FormData(e.target).get('password2') || '');
+    if (!em || !pw) { $('#lerr').textContent = 'Inserisci email e password.'; return; }
+    if (pw.length < 6) { $('#lerr').textContent = authMsg({ code: 'auth/weak-password' }); return; }
     if (pw !== pw2) { $('#lerr').textContent = 'Le due password non coincidono.'; return; }
     doAuth(() => store.auth.signUp(em, pw)); // appena creato l'account si entra subito nell'app
   } else if (id === 'df') {
@@ -944,6 +979,7 @@ document.addEventListener('click', e => {
     case 'auth-mode': S.authMode = el.dataset.v; render(); break;
     case 'google': doAuth(() => store.auth.google()); break;
     case 'delete-account': deleteAccountSheet(); break;
+    case 'diag': checkConn($('#diag') || $('#diag2')); break;
     case 'reset': {
       const [em] = loginVals();
       if (!em) { $('#lerr').textContent = 'Scrivi prima la tua email.'; break; }
